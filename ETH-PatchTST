@@ -1,0 +1,244 @@
+import torch
+import torch.nn as nn
+import pandas as pd
+import numpy as np
+import requests
+from datetime import timedelta
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import RobustScaler
+from torch.utils.data import Dataset, DataLoader
+
+def fetch_data():
+    url = 'https://min-api.cryptocompare.com/data/v2/histoday'
+    params = {'fsym': 'ETH', 'tsym': 'USD', 'limit': 2000}
+    response = requests.get(url, params=params)
+    data = response.json()['Data']['Data']
+    df = pd.DataFrame(data, columns=['time', 'close', 'open', 'high', 'low', 'volumeto'])
+    df['time'] = pd.to_datetime(df['time'], unit='s')
+    df.set_index('time', inplace=True)
+    return df
+
+def directional_accuracy(predictions, targets):
+    pred_direction = np.sign(np.diff(predictions))
+    target_direction = np.sign(np.diff(targets))
+    correct_direction = np.sum(pred_direction == target_direction)
+    total_predictions = pred_direction.size
+    return correct_direction / total_predictions if total_predictions > 0 else 0 
+
+class ETHDataset(Dataset):
+    def __init__(self, df, n_input, n_output):
+        self.df = df
+        self.n_input = n_input
+        self.n_output = n_output
+        self.scaler = RobustScaler()
+        self.df_scaled = pd.DataFrame(self.scaler.fit_transform(df), columns=df.columns, index=df.index)
+        self.df_changes = self.df_scaled.diff().fillna(0)
+
+    def __len__(self):
+        return len(self.df_changes) - self.n_input - self.n_output + 1
+
+    def __getitem__(self, idx):
+        idx = int(idx)
+        seq = self.df_changes.iloc[idx:idx + self.n_input].values
+        target = self.df_changes.iloc[idx + self.n_input:idx + self.n_input + self.n_output]['close'].values
+        return torch.FloatTensor(seq), torch.FloatTensor(target)
+
+class PatchTST(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_dim, num_layers, num_heads, patch_len, stride, forecast_length):
+        super().__init__()
+        self.patch_len = patch_len
+        self.stride = stride
+        self.forecast_length = forecast_length
+        self.patch_embedding = nn.Conv1d(input_dim, hidden_dim, kernel_size=patch_len, stride=stride)
+        self.positional_encoding = nn.Parameter(torch.randn(1, hidden_dim, 1))
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,
+            batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x = x.transpose(1, 2)
+        x = self.patch_embedding(x)
+        num_patches = x.size(2)
+        pos_enc = self.positional_encoding[:, :, :num_patches]
+        x = x + pos_enc
+        x = x.transpose(1, 2)
+        x = self.transformer_encoder(x)
+        x = self.fc(x[:, -self.forecast_length:, :])
+        return x.squeeze(-1)
+
+def train_model(model, train_loader, val_loader, epochs=100, lr=0.0001, patience=20):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    criterion = nn.HuberLoss()
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.5)
+    best_val_loss = float('inf')
+    counter = 0
+    train_losses, val_losses = [], []
+
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item()
+
+        train_loss /= len(train_loader)
+        train_losses.append(train_loss)
+
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for inputs, targets in val_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                val_loss += loss.item()
+
+        val_loss /= len(val_loader)
+        val_losses.append(val_loss)
+
+        scheduler.step(val_loss)
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            counter = 0
+            torch.save(model.state_dict(), 'best_model.pth')
+        else:
+            counter += 1
+
+        if counter >= patience:
+            print(f'Early stopping at epoch {epoch + 1}')
+            break
+
+        if (epoch + 1) % 10 == 0:
+            print(f'Epoch [{epoch + 1}/{epochs}], Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+
+    model.load_state_dict(torch.load('best_model.pth'))
+    return model, train_losses, val_losses
+
+def predict(model, test_loader, scaler, last_known_price):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+    predictions = []
+    with torch.no_grad():
+        for inputs, _ in test_loader:
+            inputs = inputs.to(device)
+            outputs = model(inputs)
+            predictions.extend(outputs.cpu().numpy())
+
+    predictions = np.array(predictions)
+    cumulative_changes = np.cumsum(predictions, axis=1)
+    price_predictions = last_known_price + cumulative_changes * scaler.scale_[0]
+
+    return price_predictions
+
+def rolling_forecast(model, initial_input, scaler, n_steps, last_known_price):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+    current_input = initial_input.clone()
+    predictions = []
+
+    for _ in range(n_steps):
+        with torch.no_grad():
+            output = model(current_input.unsqueeze(0).to(device))
+            predictions.append(output.cpu().numpy().flatten())
+
+            new_input = output.cpu().numpy().flatten()
+            new_input_padded = np.zeros_like(current_input.numpy())
+            new_input_padded[1:] = current_input.numpy()[:-1]
+            new_input_padded[-1] = new_input
+
+            current_input = torch.FloatTensor(new_input_padded)
+
+    predictions = np.array(predictions)
+    cumulative_changes = np.cumsum(predictions, axis=0)
+    price_predictions = last_known_price + cumulative_changes * scaler.scale_[0]
+
+    return price_predictions.flatten()
+
+def main():
+    n_input = 994
+    n_output = 1
+    hidden_dim = 128
+    num_layers = 4
+    num_heads = 8
+    patch_len = 14
+    stride = 2
+    batch_size = 64
+
+    df = fetch_data()
+    last_known_price = df['close'].iloc[-1]
+    print(f"Last known price: ${last_known_price:.2f}")
+
+    dataset = ETHDataset(df, n_input, n_output)
+    train_size = int(0.8 * len(dataset))
+    val_size = int(0.1 * len(dataset))
+    test_size = len(dataset) - train_size - val_size
+
+    train_dataset = torch.utils.data.Subset(dataset, range(0, train_size))
+    val_dataset = torch.utils.data.Subset(dataset, range(train_size, train_size + val_size))
+    test_dataset = torch.utils.data.Subset(dataset, range(train_size + val_size, len(dataset)))
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+    input_dim = df.shape[1]
+    output_dim = 1
+
+    model = PatchTST(input_dim, output_dim, hidden_dim, num_layers, num_heads, patch_len, stride,
+                     forecast_length=n_output)
+    model, train_losses, val_losses = train_model(model, train_loader, val_loader)
+
+    initial_input = torch.FloatTensor(dataset.df_changes.iloc[-n_input:].values)
+    future_prediction = rolling_forecast(model, initial_input, dataset.scaler, 7, last_known_price)
+
+    last_timestamp = df.index[-1]
+    future_timestamps = [last_timestamp + timedelta(days=i + 1) for i in range(7)]
+    predictions_df = pd.DataFrame({
+        'Timestamp': future_timestamps,
+        'Predicted Price': future_prediction
+    })
+
+    print("\nDaily ETH price predictions for the next 7 days:")
+    print(predictions_df.to_string(index=False))
+
+    test_predictions = predict(model, test_loader, dataset.scaler, last_known_price)
+    test_targets = []
+    for _, targets in test_loader:
+        test_targets.extend(targets.numpy())
+    test_targets = np.array(test_targets)
+
+    min_len = min(len(test_predictions), len(test_targets))
+    test_predictions = test_predictions[:min_len]
+    test_targets = test_targets[:min_len]
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(df.index[-n_input:], df['close'].tail(n_input), label='Historical')
+    plt.plot(predictions_df['Timestamp'], predictions_df['Predicted Price'], marker='o', label='Predicted')
+    plt.title('ETH Price Prediction for Next 7 days using PatchTST')
+    plt.xlabel('Time')
+    plt.ylabel('Price (USD)')
+    plt.legend()
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == "__main__":
+    main()
