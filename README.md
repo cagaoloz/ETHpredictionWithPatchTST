@@ -20,3 +20,5 @@ Daily ETH price predictions for the next 7 days:
 2024-08-15      2708.531738
 
 2024-08-16      2701.342773
+
+![download](https://github.com/user-attachments/assets/853af229-22f3-4b7f-b114-ee0a409c5f42)
