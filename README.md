@@ -1,4 +1,4 @@
-The purpose of this project is to predict ETH prices for the next 7 days using the PatchTST model in python. For these predictions, it uses 1000 days of ETH price data that it pulls with api.
+The purpose of this project is to predict ETH prices for the next 7 days using the PatchTST model in Python. For these predictions, it uses 1000 days of ETH price data that it pulls with api.
 
 ------------
 Last known price: $2701.56
